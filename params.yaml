@@ -1,0 +1,61 @@
+preprocessing:
+  frames_per_video: 20
+  tall_grid_size: 16
+  tall_grid_rows: 4
+  tall_grid_cols: 4
+  face_size: 224
+  tall_face_size: 112
+  face_confidence: 0.95
+  face_margin: 0.3
+  jpg_quality: 95
+
+split:
+  train_size: 0.72
+  val_size: 0.14
+  test_size: 0.14
+  random_seed: 42
+
+efficientnet:
+  model_name: tf_efficientnet_b4
+  pretrained: true
+  num_classes: 1
+  dropout: 0.4
+  input_size: 224
+  gem_p: 3.0
+
+tall_swin:
+  model_name: swin_tiny_patch4_window7_224
+  pretrained: true
+  num_classes: 1
+  dropout: 0.3
+  input_size: 224
+
+ensemble:
+  init_weight_efficientnet: 0.6
+  init_weight_swin: 0.4
+  num_classes: 1
+
+training:
+  seed: 42
+  num_epochs: 30
+  batch_size: 16
+  num_workers: 4
+  pin_memory: true
+  mixed_precision: true
+  optimizer: adamw
+  learning_rate: 0.0001
+  weight_decay: 0.0001
+  scheduler: cosine
+  warmup_epochs: 3
+  min_lr: 0.0000001
+  focal_alpha: 0.25
+  focal_gamma: 2.0
+  patience: 7
+  monitor: val_auc
+  save_top_k: 3
+  grad_clip: 1.0
+
+evaluation:
+  primary_metric: auc_roc
+  decision_threshold: 0.5
+  cross_dataset_test: celeb_df
