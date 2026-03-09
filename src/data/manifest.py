@@ -186,13 +186,62 @@ def build_manifests(
     dfdc_df["split"] = "train"
     logger.info("DFDC train samples: %d", len(dfdc_df))
 
-    # --- Celeb-DF (all to test, cross-dataset) ---
+    # --- Celeb-DF (official test list, cross-dataset) ---
     celeb_df = records_to_dataframe(celeb_records)
     if len(celeb_df) == 0:
         raise ValueError(
             "Celeb-DF produced no valid records. "
             "Check preprocessing completed successfully."
         )
+
+    # Filter to official test split using List_of_testing_videos.txt.
+    # This ensures AUC scores are directly comparable to published benchmarks
+    # (TALL paper, Celeb-DF v2 paper). The file lists relative video paths,
+    # one per line, prefixed by a label int (0=real, 1=fake).
+    # Example lines:
+    #   0 YouTube-real/00001.mp4
+    #   1 Celeb-synthesis/id0_id1_0001.mp4
+    test_list_path = cfg.paths.celeb_df_test_list
+    if test_list_path.exists():
+        official_stems: set[str] = set()
+        with open(test_list_path, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                # Each line: "<label> <relative/path/video.mp4>"
+                parts = line.split(" ", 1)
+                if len(parts) == 2:
+                    # Extract the video stem without extension
+                    official_stems.add(Path(parts[1]).stem)
+
+        # Match against source_path stems in our records
+        # source_path is the original mp4, so stem matches the test list
+        pre_filter = len(celeb_df)
+        celeb_df["_stem"] = celeb_df["face_dir"].apply(
+            lambda p: Path(p).name  # face_dir leaf == video stem
+        )
+        celeb_df = celeb_df[
+            celeb_df["_stem"].isin(official_stems)
+        ].drop(columns=["_stem"]).copy()
+
+        logger.info(
+            "Celeb-DF official test filter: %d -> %d records (%d stems in list)",
+            pre_filter, len(celeb_df), len(official_stems),
+        )
+        if len(celeb_df) == 0:
+            logger.warning(
+                "Official test filter removed ALL records. "
+                "Falling back to full Celeb-DF dataset as test set."
+            )
+            celeb_df = records_to_dataframe(celeb_records)
+    else:
+        logger.warning(
+            "List_of_testing_videos.txt not found at %s. "
+            "Using full Celeb-DF as test set.",
+            test_list_path,
+        )
+
     celeb_df["split"] = "test"
     logger.info("Celeb-DF test samples: %d", len(celeb_df))
 

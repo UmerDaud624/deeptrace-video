@@ -102,6 +102,27 @@ class DatasetPaths:
         default_factory=lambda: DATASET_ROOT / "DFDC"
     )
 
+    # Celeb-DF v2 subfolders
+    @property
+    def celeb_df_real(self) -> Path:
+        """590 real celebrity videos."""
+        return self.celeb_df / "Celeb-real"
+
+    @property
+    def celeb_df_youtube_real(self) -> Path:
+        """300 real YouTube videos."""
+        return self.celeb_df / "YouTube-real"
+
+    @property
+    def celeb_df_fake(self) -> Path:
+        """5639 synthesized fake videos."""
+        return self.celeb_df / "Celeb-synthesis"
+
+    @property
+    def celeb_df_test_list(self) -> Path:
+        """Official test split from Celeb-DF v2 authors."""
+        return self.celeb_df / "List_of_testing_videos.txt"
+
     @property
     def ff_original(self) -> Path:
         return self.ff_plus_plus / "original_sequences/youtube/c23/videos"
