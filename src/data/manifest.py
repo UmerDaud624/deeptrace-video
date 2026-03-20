@@ -4,12 +4,13 @@ src/data/manifest.py
 Generates and saves train/val/test CSV manifests from preprocessed records.
 
 Split strategy:
-    Train  --> FF++ train split + all DFDC
+    Train  --> FF++ train split + all DFDC + Celeb-DF non-test videos
     Val    --> FF++ val split only
-    Test   --> Celeb-DF v2 entire dataset (cross-dataset, unseen domain)
+    Test   --> Celeb-DF v2 official 518-video test split (benchmark-comparable)
 
-This matches the evaluation protocol used in the TALL and Guardian-AI
-papers cited in the DeepTrace literature review.
+The Celeb-DF non-test videos (6011 videos) are added to training to improve
+cross-domain generalization while keeping the official test split strictly
+held out for benchmark-comparable AUC reporting.
 
 CSV columns:
     face_dir    --> directory containing face crop JPGs (EfficientNet input)
@@ -58,7 +59,6 @@ def records_to_dataframe(records: list[VideoRecord]) -> pd.DataFrame:
     skipped = 0
 
     for rec in records:
-        # Both outputs must exist and face_dir must be non-empty
         if not Path(rec.tall_path).exists():
             skipped += 1
             continue
@@ -111,7 +111,6 @@ def split_ff_dataframe(df: pd.DataFrame) -> pd.DataFrame:
 
     test_and_val_size = split_cfg.val_size + split_cfg.test_size
 
-    # First split: train vs (val + test)
     train_idx, temp_idx = train_test_split(
         df.index,
         test_size=test_and_val_size,
@@ -119,7 +118,6 @@ def split_ff_dataframe(df: pd.DataFrame) -> pd.DataFrame:
         random_state=split_cfg.random_seed,
     )
 
-    # Second split: val vs test from temp
     val_fraction = split_cfg.val_size / test_and_val_size
     val_idx, test_idx = train_test_split(
         temp_idx,
@@ -151,9 +149,13 @@ def build_manifests(
     """
     Build train/val/test manifests from all three datasets.
 
-    Train: FF++ train split + all DFDC
+    Train: FF++ train split + all DFDC + Celeb-DF non-test videos
     Val:   FF++ val split
-    Test:  Celeb-DF v2 (full, cross-dataset evaluation)
+    Test:  Celeb-DF v2 official 518-video test split only
+
+    The Celeb-DF non-test videos (6011 videos) are added to training
+    to improve cross-domain generalization. The official 518-video
+    test split is strictly held out so AUC remains benchmark-comparable.
 
     Args:
         ff_records:    From FFPlusPlusPreprocessor.run()
@@ -186,7 +188,7 @@ def build_manifests(
     dfdc_df["split"] = "train"
     logger.info("DFDC train samples: %d", len(dfdc_df))
 
-    # --- Celeb-DF (official test list, cross-dataset) ---
+    # --- Celeb-DF: split into official test set and training pool ---
     celeb_df = records_to_dataframe(celeb_records)
     if len(celeb_df) == 0:
         raise ValueError(
@@ -194,66 +196,78 @@ def build_manifests(
             "Check preprocessing completed successfully."
         )
 
-    # Filter to official test split using List_of_testing_videos.txt.
-    # This ensures AUC scores are directly comparable to published benchmarks
-    # (TALL paper, Celeb-DF v2 paper). The file lists relative video paths,
-    # one per line, prefixed by a label int (0=real, 1=fake).
-    # Example lines:
-    #   0 YouTube-real/00001.mp4
-    #   1 Celeb-synthesis/id0_id1_0001.mp4
+    # Load official test stems from List_of_testing_videos.txt.
+    # These 518 videos are strictly held out for evaluation.
+    # All remaining Celeb-DF videos go into training to improve
+    # cross-domain generalization.
     test_list_path = cfg.paths.celeb_df_test_list
+    official_stems: set[str] = set()
+
     if test_list_path.exists():
-        official_stems: set[str] = set()
         with open(test_list_path, "r") as f:
             for line in f:
                 line = line.strip()
                 if not line:
                     continue
-                # Each line: "<label> <relative/path/video.mp4>"
                 parts = line.split(" ", 1)
                 if len(parts) == 2:
-                    # Extract the video stem without extension
                     official_stems.add(Path(parts[1]).stem)
-
-        # Match against source_path stems in our records
-        # source_path is the original mp4, so stem matches the test list
-        pre_filter = len(celeb_df)
-        celeb_df["_stem"] = celeb_df["face_dir"].apply(
-            lambda p: Path(p).name  # face_dir leaf == video stem
-        )
-        celeb_df = celeb_df[
-            celeb_df["_stem"].isin(official_stems)
-        ].drop(columns=["_stem"]).copy()
-
         logger.info(
-            "Celeb-DF official test filter: %d -> %d records (%d stems in list)",
-            pre_filter, len(celeb_df), len(official_stems),
+            "Loaded %d official test stems from %s",
+            len(official_stems), test_list_path,
         )
-        if len(celeb_df) == 0:
-            logger.warning(
-                "Official test filter removed ALL records. "
-                "Falling back to full Celeb-DF dataset as test set."
-            )
-            celeb_df = records_to_dataframe(celeb_records)
     else:
         logger.warning(
             "List_of_testing_videos.txt not found at %s. "
-            "Using full Celeb-DF as test set.",
+            "All Celeb-DF records will go to test set.",
             test_list_path,
         )
 
-    celeb_df["split"] = "test"
-    logger.info("Celeb-DF test samples: %d", len(celeb_df))
+    # Tag each record as test (official list) or train (remainder)
+    celeb_df["_stem"] = celeb_df["face_dir"].apply(
+        lambda p: Path(p).name
+    )
 
-    # --- Combine ---
+    if official_stems:
+        celeb_test  = celeb_df[
+            celeb_df["_stem"].isin(official_stems)
+        ].drop(columns=["_stem"]).copy()
+        celeb_train = celeb_df[
+            ~celeb_df["_stem"].isin(official_stems)
+        ].drop(columns=["_stem"]).copy()
+    else:
+        celeb_test  = celeb_df.drop(columns=["_stem"]).copy()
+        celeb_train = pd.DataFrame(columns=celeb_df.columns)
+
+    if len(celeb_test) == 0:
+        logger.warning(
+            "Official test filter matched no records. "
+            "Falling back to full Celeb-DF as test set."
+        )
+        celeb_test  = celeb_df.drop(columns=["_stem"]).copy()
+        celeb_train = pd.DataFrame(columns=celeb_df.columns)
+
+    celeb_test["split"]  = "test"
+    celeb_train["split"] = "train"
+
+    logger.info(
+        "Celeb-DF split -- test (official): %d | train (non-test): %d",
+        len(celeb_test), len(celeb_train),
+    )
+
+    # --- Combine train: FF++ + DFDC + Celeb-DF non-test ---
+    train_parts = [ff_train, dfdc_df]
+    if len(celeb_train) > 0:
+        train_parts.append(celeb_train)
+
     train_df = pd.concat(
-        [ff_train, dfdc_df], ignore_index=True
+        train_parts, ignore_index=True
     ).sample(
         frac=1.0, random_state=split_cfg.random_seed
     ).reset_index(drop=True)
 
     val_df  = ff_val.reset_index(drop=True)
-    test_df = celeb_df.reset_index(drop=True)
+    test_df = celeb_test.reset_index(drop=True)
 
     # Log class distribution for each split
     for name, df in [("train", train_df), ("val", val_df), ("test", test_df)]:
@@ -328,17 +342,13 @@ def load_manifest(csv_path: str) -> pd.DataFrame:
     if missing:
         raise ValueError(f"Manifest missing columns: {missing}")
 
-    logger.info(
-        "Loaded manifest: %s (%d rows)", csv_path, len(df)
-    )
+    logger.info("Loaded manifest: %s (%d rows)", csv_path, len(df))
     return df
 
 
 def get_manifest_stats(df: pd.DataFrame) -> dict:
     """
     Compute summary statistics for a manifest DataFrame.
-
-    Useful for logging before training starts.
 
     Args:
         df: Manifest DataFrame from load_manifest().
