@@ -63,7 +63,6 @@ class VideoRecord:
     tall_path      : str    # path to saved TALL grid JPG
     num_faces      : int    # number of valid face crops extracted
     frames_sampled : int    # number of frames attempted
-    split          : str = ""
 
 
 @dataclass
@@ -593,4 +592,150 @@ class DFDCPreprocessor:
                 failed += 1
 
         logger.info("DFDC done: %d ok, %d failed", len(records), failed)
+        return records
+
+
+class DFDCVideoPreprocessor:
+    """
+    Preprocesses raw DFDC MP4 videos from downloaded training parts.
+
+    Unlike DFDCPreprocessor (which handles pre-extracted PNG crops),
+    this runs the full RetinaFace pipeline on raw videos -- same as
+    FFPlusPlusPreprocessor and CelebDFPreprocessor.
+
+    Expected input structure:
+        <parts_root>/
+            part18/
+                dfdc_train_part_18/
+                    metadata.json       <-- label file
+                    aaabcd.mp4
+                    ...
+            part19/
+                dfdc_train_part_19/
+                    metadata.json
+                    ...
+
+    Output structure:
+        <preprocessed_root>/dfdc_video/
+            faces/<subset>/<video_stem>/  <-- face crop JPGs
+            tall/<subset>/<video_stem>.jpg  <-- TALL grid
+    """
+
+    def __init__(self, parts_root: str) -> None:
+        """
+        Args:
+            parts_root: Path to the directory containing downloaded DFDC parts.
+                        e.g. /content/drive/MyDrive/DeepTrace/datasets/DFDC/parts
+        """
+        self.parts_root = Path(parts_root)
+        self.out_dir    = PREPROCESSED_ROOT / "dfdc_video"
+
+    def _collect(self) -> list[tuple[str, int, str]]:
+        """
+        Walk all part directories, read metadata.json, collect video paths
+        with their labels.
+
+        Returns:
+            List of (video_path, label, subset) tuples.
+            subset is 'dfdc_video_real' or 'dfdc_video_fake'.
+        """
+        entries = []
+
+        if not self.parts_root.exists():
+            logger.warning("DFDC parts root not found: %s", self.parts_root)
+            return entries
+
+        # Walk each part directory
+        for part_dir in sorted(self.parts_root.iterdir()):
+            if not part_dir.is_dir():
+                continue
+
+            # Videos may be directly in part_dir or one level deeper
+            metadata_candidates = list(part_dir.rglob("metadata.json"))
+            if not metadata_candidates:
+                logger.warning("No metadata.json in %s -- skipping", part_dir)
+                continue
+
+            metadata_path = metadata_candidates[0]
+            video_dir     = metadata_path.parent
+
+            try:
+                with open(metadata_path) as f:
+                    import json
+                    metadata = json.load(f)
+            except Exception as exc:
+                logger.warning("Failed to load metadata %s: %s", metadata_path, exc)
+                continue
+
+            part_real, part_fake = 0, 0
+            for filename, info in metadata.items():
+                label_str = info.get("label", "").upper()
+                video_path = video_dir / filename
+
+                if not video_path.exists():
+                    continue
+
+                if label_str == "REAL":
+                    entries.append((str(video_path), 0, "dfdc_video_real"))
+                    part_real += 1
+                elif label_str == "FAKE":
+                    entries.append((str(video_path), 1, "dfdc_video_fake"))
+                    part_fake += 1
+
+            logger.info(
+                "Part %s: %d real, %d fake",
+                part_dir.name, part_real, part_fake,
+            )
+
+        logger.info(
+            "DFDC video collected %d total videos (%d parts)",
+            len(entries),
+            sum(1 for p in self.parts_root.iterdir() if p.is_dir()),
+        )
+        return entries
+
+    def run(self) -> list[VideoRecord]:
+        """
+        Run full RetinaFace preprocessing on all collected videos.
+        Resume-safe: skips already-processed videos.
+
+        Returns:
+            List of VideoRecord objects ready for manifest building.
+        """
+        entries = self._collect()
+        if not entries:
+            logger.warning("No DFDC video entries found. Check parts_root path.")
+            return []
+
+        records, failed = [], 0
+
+        for video_path, label, subset in tqdm(
+            entries, desc="DFDC-video", unit="video"
+        ):
+            stem      = Path(video_path).stem
+            face_dir  = str(self.out_dir / "faces" / subset / stem)
+            tall_path = str(self.out_dir / "tall"  / subset / f"{stem}.jpg")
+
+            try:
+                num_faces, num_frames = process_video(
+                    video_path, face_dir, tall_path, label
+                )
+            except Exception as exc:
+                logger.warning("Error %s: %s", video_path, exc)
+                failed += 1
+                continue
+
+            if num_faces > 0:
+                records.append(VideoRecord(
+                    source_path=video_path, label=label,
+                    dataset="dfdc", subset=subset,
+                    face_dir=face_dir, tall_path=tall_path,
+                    num_faces=num_faces, frames_sampled=num_frames,
+                ))
+            else:
+                failed += 1
+
+        logger.info(
+            "DFDC video done: %d ok, %d failed", len(records), failed
+        )
         return records
