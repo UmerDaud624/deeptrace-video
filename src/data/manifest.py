@@ -75,7 +75,6 @@ def records_to_dataframe(records: list[VideoRecord]) -> pd.DataFrame:
             "label"     : rec.label,
             "dataset"   : rec.dataset,
             "subset"    : rec.subset,
-            "split"     : rec.split,
             "num_faces" : rec.num_faces,
         })
 
