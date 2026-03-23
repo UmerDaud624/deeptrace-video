@@ -4,13 +4,13 @@ src/data/manifest.py
 Generates and saves train/val/test CSV manifests from preprocessed records.
 
 Split strategy:
-    Train  --> FF++ train split + all DFDC + Celeb-DF non-test videos
+    Train  --> FF++ train split + all DFDC only
     Val    --> FF++ val split only
-    Test   --> Celeb-DF v2 official 518-video test split (benchmark-comparable)
+    Test   --> Celeb-DF v2 official 518-video test split (cross-dataset)
 
-The Celeb-DF non-test videos (6011 videos) are added to training to improve
-cross-domain generalization while keeping the official test split strictly
-held out for benchmark-comparable AUC reporting.
+Celeb-DF is used exclusively for cross-dataset evaluation. No Celeb-DF
+videos appear in training, ensuring the test AUC is a true cross-dataset
+generalization metric.
 
 CSV columns:
     face_dir    --> directory containing face crop JPGs (EfficientNet input)
@@ -148,13 +148,13 @@ def build_manifests(
     """
     Build train/val/test manifests from all three datasets.
 
-    Train: FF++ train split + all DFDC + Celeb-DF non-test videos
+    Train: FF++ train split + all DFDC only
     Val:   FF++ val split
-    Test:  Celeb-DF v2 official 518-video test split only
+    Test:  Celeb-DF v2 official 518-video test split (cross-dataset)
 
-    The Celeb-DF non-test videos (6011 videos) are added to training
-    to improve cross-domain generalization. The official 518-video
-    test split is strictly held out so AUC remains benchmark-comparable.
+    Celeb-DF is strictly reserved for cross-dataset evaluation.
+    No Celeb-DF videos appear in training so the test AUC reflects
+    true cross-dataset generalization.
 
     Args:
         ff_records:    From FFPlusPlusPreprocessor.run()
@@ -196,9 +196,9 @@ def build_manifests(
         )
 
     # Load official test stems from List_of_testing_videos.txt.
-    # These 518 videos are strictly held out for evaluation.
-    # All remaining Celeb-DF videos go into training to improve
-    # cross-domain generalization.
+    # These 518 videos form the cross-dataset test set.
+    # All remaining Celeb-DF videos are discarded from training
+    # to preserve the integrity of the cross-dataset evaluation.
     test_list_path = cfg.paths.celeb_df_test_list
     official_stems: set[str] = set()
 
@@ -254,10 +254,11 @@ def build_manifests(
         len(celeb_test), len(celeb_train),
     )
 
-    # --- Combine train: FF++ + DFDC + Celeb-DF non-test ---
+    # --- Combine train: FF++ + DFDC only ---
+    # Celeb-DF is strictly reserved for cross-dataset evaluation.
+    # Including it in training would invalidate the test AUC as a
+    # cross-dataset generalization metric.
     train_parts = [ff_train, dfdc_df]
-    if len(celeb_train) > 0:
-        train_parts.append(celeb_train)
 
     train_df = pd.concat(
         train_parts, ignore_index=True
