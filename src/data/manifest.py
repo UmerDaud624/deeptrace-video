@@ -182,11 +182,21 @@ def build_manifests(
     ff_train = ff_df[ff_df["split"] == "train"].copy()
     ff_val   = ff_df[ff_df["split"] == "val"].copy()
 
-    # --- DFDC (all to train) ---
     dfdc_df = records_to_dataframe(dfdc_records)
-    dfdc_df["split"] = "train"
-    logger.info("DFDC train samples: %d", len(dfdc_df))
-
+    dfdc_train_idx, dfdc_val_idx = train_test_split(
+        dfdc_df.index,
+        test_size=0.10,
+        stratify=dfdc_df["label"],
+        random_state=split_cfg.random_seed,
+    )
+    dfdc_df.loc[dfdc_train_idx, "split"] = "train"
+    dfdc_df.loc[dfdc_val_idx,   "split"] = "val"
+    dfdc_train = dfdc_df[dfdc_df["split"] == "train"].copy()
+    dfdc_val   = dfdc_df[dfdc_df["split"] == "val"].copy()
+    logger.info(
+        "DFDC split -- train: %d | val: %d",
+        len(dfdc_train), len(dfdc_val),
+    )
     # --- Celeb-DF: split into official test set and training pool ---
     celeb_df = records_to_dataframe(celeb_records)
     if len(celeb_df) == 0:
@@ -258,7 +268,7 @@ def build_manifests(
     # Celeb-DF is strictly reserved for cross-dataset evaluation.
     # Including it in training would invalidate the test AUC as a
     # cross-dataset generalization metric.
-    train_parts = [ff_train, dfdc_df]
+    train_parts = [ff_train, dfdc_train]
 
     train_df = pd.concat(
         train_parts, ignore_index=True
@@ -266,7 +276,12 @@ def build_manifests(
         frac=1.0, random_state=split_cfg.random_seed
     ).reset_index(drop=True)
 
-    val_df  = ff_val.reset_index(drop=True)
+    val_df = pd.concat(
+        [ff_val, dfdc_val], ignore_index=True
+    ).sample(
+        frac=1.0, random_state=split_cfg.random_seed
+    ).reset_index(drop=True)
+
     test_df = celeb_test.reset_index(drop=True)
 
     # Log class distribution for each split
