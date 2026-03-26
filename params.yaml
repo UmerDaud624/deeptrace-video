@@ -5,7 +5,7 @@ preprocessing:
   tall_grid_cols: 4
   face_size: 224
   tall_face_size: 112
-  face_confidence: 0.20
+  face_confidence: 0.95
   face_margin: 0.3
   jpg_quality: 95
 
