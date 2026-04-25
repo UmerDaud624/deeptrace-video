@@ -739,3 +739,485 @@ class DFDCVideoPreprocessor:
             "DFDC video done: %d ok, %d failed", len(records), failed
         )
         return records
+
+
+class DF40Preprocessor:
+    """
+    Preprocesses DF40 dataset subsets for DeepTrace training.
+
+    DF40 contains image-based deepfakes (not videos). This preprocessor
+    handles three structural patterns found across DF40 methods:
+
+    Pattern A -- identity subfolders in fake, flat real:
+        Method/
+            fake/<identity>/*.png
+            real/*.jpg
+
+    Pattern B -- flat fake with GIF/PNG/JPG, flat real:
+        Method/
+            fake/*.gif  (or *.png, *.jpg)
+            real/*.jpg
+
+    Pattern C -- domain subfolders then identity subfolders, no real:
+        Method/
+            <domain>/<identity>/*.png
+            (no real folder -- real images come from FF++/CDF)
+
+    The preprocessor auto-detects which pattern applies at runtime.
+    For patterns with real images, both real and fake are processed.
+    For fake-only patterns (C), only fakes are processed and real
+    images are sourced from the existing FF++ preprocessed records.
+
+    Face detection runs RetinaFace on each image. The TALL grid is
+    built by tiling multiple crops from the same identity folder
+    (or by repeating the single crop for flat structures).
+
+    Output structure mirrors existing preprocessors:
+        <preprocessed_root>/df40/<method_name>/
+            faces/<subset>/<identity_or_stem>/  <-- face crop JPGs
+            tall/<subset>/<identity_or_stem>.jpg  <-- TALL grid JPG
+
+    Args:
+        method_root: Path to extracted DF40 method directory.
+                     e.g. /content/drive/.../DF40/CollabDiff
+        method_name: Short name used in manifests and output paths.
+                     e.g. 'collabdiff', 'ddim', 'midjourney'
+        max_fake:    Maximum number of fake samples to process.
+                     Keeps training set small. Default: 2000.
+        max_real:    Maximum number of real samples to process.
+                     Only used when real folder exists. Default: 500.
+    """
+
+    def __init__(
+        self,
+        method_root : str,
+        method_name : str,
+        max_fake    : int = 2000,
+        max_real    : int = 500,
+    ) -> None:
+        self.method_root = Path(method_root)
+        self.method_name = method_name.lower().replace(" ", "_")
+        self.max_fake    = max_fake
+        self.max_real    = max_real
+        self.out_dir     = PREPROCESSED_ROOT / "df40" / self.method_name
+
+    # -------------------------------------------------------------------
+    # Structure detection
+    # -------------------------------------------------------------------
+
+    def _detect_pattern(self) -> str:
+        """
+        Auto-detect the folder structure pattern.
+
+        Returns:
+            'A' -- identity subfolders in fake, real folder exists
+            'B' -- flat fake files, real folder exists
+            'C' -- domain/identity subfolders, no real folder
+            'D' -- fake/frames/<clips> + real/<clips> (HeyGen style)
+        """
+        fake_dir = self.method_root / "fake"
+        real_dir = self.method_root / "real"
+        has_real = real_dir.exists() and any(real_dir.iterdir())
+
+        if not fake_dir.exists():
+            # Pattern C: no top-level fake/ -- domain subfolders
+            logger.info("[%s] Pattern C detected (domain subfolders, no real)",
+                        self.method_name)
+            return "C"
+
+        if not has_real:
+            logger.info("[%s] Pattern C detected (fake/ exists, no real/)",
+                        self.method_name)
+            return "C"
+
+        # Check for Pattern D: fake/frames/ subfolder (HeyGen style)
+        frames_dir = fake_dir / "frames"
+        if frames_dir.exists() and frames_dir.is_dir():
+            logger.info("[%s] Pattern D detected (frames/ subdir + real/ clips)",
+                        self.method_name)
+            return "D"
+
+        # Check if fake/ has subfolders or flat files
+        fake_contents = list(fake_dir.iterdir())
+        has_subfolders = any(p.is_dir() for p in fake_contents)
+
+        if has_subfolders:
+            logger.info("[%s] Pattern A detected (identity subfolders + real/)",
+                        self.method_name)
+            return "A"
+        else:
+            logger.info("[%s] Pattern B detected (flat fake files + real/)",
+                        self.method_name)
+            return "B"
+
+    # -------------------------------------------------------------------
+    # Image collection per pattern
+    # -------------------------------------------------------------------
+
+    def _collect_pattern_a(self) -> tuple[list, list]:
+        """
+        Collect (image_path, identity) tuples for Pattern A.
+        fake/<identity>/*.png  +  real/*.jpg
+
+        Returns:
+            (fake_entries, real_entries)
+            Each entry: (image_path, identity_stem)
+        """
+        fake_dir = self.method_root / "fake"
+        real_dir = self.method_root / "real"
+
+        fake_entries = []
+        for identity_dir in sorted(fake_dir.iterdir()):
+            if not identity_dir.is_dir():
+                continue
+            images = sorted(
+                p for p in identity_dir.iterdir()
+                if p.suffix.lower() in {".png", ".jpg", ".jpeg", ".gif"}
+            )
+            for img_path in images:
+                fake_entries.append((img_path, identity_dir.name))
+
+        real_entries = []
+        for img_path in sorted(real_dir.iterdir()):
+            if img_path.suffix.lower() in {".png", ".jpg", ".jpeg"}:
+                real_entries.append((img_path, img_path.stem))
+
+        return fake_entries, real_entries
+
+    def _collect_pattern_b(self) -> tuple[list, list]:
+        """
+        Collect entries for Pattern B.
+        fake/*.gif (or *.png/*.jpg)  +  real/*.jpg
+
+        Returns:
+            (fake_entries, real_entries)
+        """
+        fake_dir = self.method_root / "fake"
+        real_dir = self.method_root / "real"
+
+        fake_entries = [
+            (p, p.stem)
+            for p in sorted(fake_dir.iterdir())
+            if p.suffix.lower() in {".png", ".jpg", ".jpeg", ".gif"}
+        ]
+
+        real_entries = [
+            (p, p.stem)
+            for p in sorted(real_dir.iterdir())
+            if p.suffix.lower() in {".png", ".jpg", ".jpeg"}
+        ]
+
+        return fake_entries, real_entries
+
+    def _collect_pattern_c(self) -> tuple[list, list]:
+        """
+        Collect entries for Pattern C.
+        <domain>/<identity>/*.png  OR  fake/<domain>/<identity>/*.png
+        No real images.
+
+        Returns:
+            (fake_entries, [])
+        """
+        fake_entries = []
+
+        # Check if there is a top-level fake/ dir or domain dirs directly
+        fake_dir = self.method_root / "fake"
+        if fake_dir.exists():
+            search_root = fake_dir
+        else:
+            search_root = self.method_root
+
+        for domain_or_identity in sorted(search_root.iterdir()):
+            if not domain_or_identity.is_dir():
+                continue
+            # Check if this is a domain folder (contains identity subfolders)
+            # or an identity folder (contains images directly)
+            contents = list(domain_or_identity.iterdir())
+            has_subfolders = any(p.is_dir() for p in contents)
+
+            if has_subfolders:
+                # Domain folder -- recurse into identity subfolders
+                for identity_dir in sorted(domain_or_identity.iterdir()):
+                    if not identity_dir.is_dir():
+                        continue
+                    images = sorted(
+                        p for p in identity_dir.iterdir()
+                        if p.suffix.lower() in {".png", ".jpg", ".jpeg"}
+                    )
+                    stem = f"{domain_or_identity.name}_{identity_dir.name}"
+                    for img_path in images:
+                        fake_entries.append((img_path, stem))
+            else:
+                # Identity folder directly under search_root
+                images = sorted(
+                    p for p in contents
+                    if p.suffix.lower() in {".png", ".jpg", ".jpeg"}
+                )
+                for img_path in images:
+                    fake_entries.append((img_path, domain_or_identity.name))
+
+        return fake_entries, []
+
+    def _collect_pattern_d(self) -> tuple[list, list]:
+        """
+        Collect entries for Pattern D (HeyGen style).
+        fake/frames/<clip_id>/*.png  +  real/<clip_id>/*.png
+
+        Returns:
+            (fake_entries, real_entries)
+            Each entry: (image_path, clip_stem)
+        """
+        frames_dir = self.method_root / "fake" / "frames"
+        real_dir   = self.method_root / "real"
+
+        fake_entries = []
+        for clip_dir in sorted(frames_dir.iterdir()):
+            if not clip_dir.is_dir():
+                continue
+            images = sorted(
+                p for p in clip_dir.iterdir()
+                if p.suffix.lower() in {".png", ".jpg", ".jpeg"}
+            )
+            for img_path in images:
+                fake_entries.append((img_path, f"clip_{clip_dir.name}"))
+
+        real_entries = []
+        for clip_dir in sorted(real_dir.iterdir()):
+            if not clip_dir.is_dir():
+                continue
+            images = sorted(
+                p for p in clip_dir.iterdir()
+                if p.suffix.lower() in {".png", ".jpg", ".jpeg"}
+            )
+            # Sanitize clip name -- Drive clip names have + and special chars
+            safe_name = clip_dir.name.replace("+", "_").replace(" ", "_")[:50]
+            for img_path in images:
+                real_entries.append((img_path, safe_name))
+
+        return fake_entries, real_entries
+
+    # -------------------------------------------------------------------
+    # Single image processing
+    # -------------------------------------------------------------------
+
+    def _process_image_group(
+        self,
+        image_paths : list[Path],
+        identity    : str,
+        label       : int,
+        subset      : str,
+    ) -> tuple[int, int]:
+        """
+        Process a group of images belonging to the same identity.
+
+        Runs RetinaFace on each image, saves face crops, builds TALL grid.
+        Resume-safe: skips if outputs already exist.
+
+        Args:
+            image_paths: List of image paths for this identity.
+            identity:    Identity/stem string for output naming.
+            label:       0 = real, 1 = fake.
+            subset:      Subset name for output path.
+
+        Returns:
+            (num_faces, num_images_attempted)
+        """
+        face_dir  = str(self.out_dir / "faces" / subset / identity)
+        tall_path = str(self.out_dir / "tall"  / subset / f"{identity}.jpg")
+
+        # Resume-safe check
+        face_dir_path = Path(face_dir)
+        if face_dir_path.exists() and Path(tall_path).exists():
+            existing = list(face_dir_path.glob("*.jpg"))
+            if existing:
+                return len(existing), len(image_paths)
+
+        face_dir_path.mkdir(parents=True, exist_ok=True)
+        Path(tall_path).parent.mkdir(parents=True, exist_ok=True)
+
+        preproc = cfg.preprocessing
+        crops: list[np.ndarray] = []
+
+        for i, img_path in enumerate(image_paths):
+            try:
+                # Handle GIF by reading first frame
+                if img_path.suffix.lower() == ".gif":
+                    from PIL import Image as PILImage
+                    pil_img = PILImage.open(img_path).convert("RGB")
+                    frame_rgb = np.array(pil_img)
+                    frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+                else:
+                    frame_bgr = cv2.imread(str(img_path))
+                    if frame_bgr is None:
+                        continue
+                    frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+
+            except Exception as exc:
+                logger.debug("Failed to load %s: %s", img_path, exc)
+                continue
+
+            result = detect_face(
+                frame_bgr   = frame_bgr,
+                frame_idx   = i,
+                target_size = preproc.face_size,
+                min_conf    = preproc.face_confidence,
+                margin      = preproc.face_margin,
+            )
+
+            if result.success and result.crop is not None:
+                crop_path = face_dir_path / f"{i:04d}.jpg"
+                crop_bgr  = cv2.cvtColor(result.crop, cv2.COLOR_RGB2BGR)
+                cv2.imwrite(str(crop_path), crop_bgr,
+                            [cv2.IMWRITE_JPEG_QUALITY, 95])
+                crops.append(result.crop)
+
+        if not crops:
+            return 0, len(image_paths)
+
+        # Build TALL grid
+        tall_grid = build_tall_grid(
+            crops       = crops,
+            grid_rows   = preproc.tall_grid_rows,
+            grid_cols   = preproc.tall_grid_cols,
+            tile_size   = preproc.tall_face_size,
+            output_size = 224,
+        )
+        tall_bgr = cv2.cvtColor(tall_grid, cv2.COLOR_RGB2BGR)
+        cv2.imwrite(tall_path, tall_bgr, [cv2.IMWRITE_JPEG_QUALITY, 95])
+
+        return len(crops), len(image_paths)
+
+    # -------------------------------------------------------------------
+    # Main run
+    # -------------------------------------------------------------------
+
+    def run(self) -> list[VideoRecord]:
+        """
+        Run preprocessing on this DF40 method.
+
+        Auto-detects structure, collects image paths, runs RetinaFace,
+        saves face crops and TALL grids, returns VideoRecord list.
+
+        Returns:
+            List of VideoRecord objects ready for manifest building.
+        """
+        if not self.method_root.exists():
+            logger.warning(
+                "DF40 method root not found: %s", self.method_root
+            )
+            return []
+
+        pattern = self._detect_pattern()
+
+        if pattern == "A":
+            fake_entries, real_entries = self._collect_pattern_a()
+        elif pattern == "B":
+            fake_entries, real_entries = self._collect_pattern_b()
+        elif pattern == "D":
+            fake_entries, real_entries = self._collect_pattern_d()
+        else:
+            fake_entries, real_entries = self._collect_pattern_c()
+
+        # Cap at max_fake and max_real
+        # Shuffle before capping to get variety across identities
+        import random
+        random.seed(42)
+        random.shuffle(fake_entries)
+        random.shuffle(real_entries)
+        fake_entries = fake_entries[:self.max_fake]
+        real_entries = real_entries[:self.max_real]
+
+        logger.info(
+            "[%s] Pattern %s | fake: %d | real: %d",
+            self.method_name, pattern,
+            len(fake_entries), len(real_entries),
+        )
+
+        # Group fake entries by identity
+        from collections import defaultdict
+        fake_groups: dict[str, list[Path]] = defaultdict(list)
+        for img_path, identity in fake_entries:
+            fake_groups[identity].append(img_path)
+
+        real_groups: dict[str, list[Path]] = defaultdict(list)
+        for img_path, identity in real_entries:
+            real_groups[identity].append(img_path)
+
+        records: list[VideoRecord] = []
+        failed = 0
+
+        # Process fakes
+        fake_subset = f"df40_{self.method_name}_fake"
+        for identity, images in tqdm(
+            fake_groups.items(),
+            desc=f"DF40-{self.method_name}-fake",
+            unit="identity",
+        ):
+            num_faces, num_imgs = self._process_image_group(
+                image_paths = images,
+                identity    = identity,
+                label       = 1,
+                subset      = fake_subset,
+            )
+            if num_faces > 0:
+                face_dir  = str(
+                    self.out_dir / "faces" / fake_subset / identity
+                )
+                tall_path = str(
+                    self.out_dir / "tall" / fake_subset / f"{identity}.jpg"
+                )
+                records.append(VideoRecord(
+                    source_path    = str(images[0].parent),
+                    label          = 1,
+                    dataset        = "df40",
+                    subset         = fake_subset,
+                    face_dir       = face_dir,
+                    tall_path      = tall_path,
+                    num_faces      = num_faces,
+                    frames_sampled = num_imgs,
+                ))
+            else:
+                failed += 1
+
+        # Process reals (only for patterns A and B)
+        if real_groups:
+            real_subset = f"df40_{self.method_name}_real"
+            for identity, images in tqdm(
+                real_groups.items(),
+                desc=f"DF40-{self.method_name}-real",
+                unit="identity",
+            ):
+                num_faces, num_imgs = self._process_image_group(
+                    image_paths = images,
+                    identity    = identity,
+                    label       = 0,
+                    subset      = real_subset,
+                )
+                if num_faces > 0:
+                    face_dir  = str(
+                        self.out_dir / "faces" / real_subset / identity
+                    )
+                    tall_path = str(
+                        self.out_dir / "tall" / real_subset / f"{identity}.jpg"
+                    )
+                    records.append(VideoRecord(
+                        source_path    = str(images[0]),
+                        label          = 0,
+                        dataset        = "df40",
+                        subset         = real_subset,
+                        face_dir       = face_dir,
+                        tall_path      = tall_path,
+                        num_faces      = num_faces,
+                        frames_sampled = num_imgs,
+                    ))
+                else:
+                    failed += 1
+
+        real_count = sum(1 for r in records if r.label == 0)
+        fake_count = sum(1 for r in records if r.label == 1)
+        logger.info(
+            "[%s] Done: %d ok (%d real, %d fake) | %d failed",
+            self.method_name, len(records),
+            real_count, fake_count, failed,
+        )
+        return records
